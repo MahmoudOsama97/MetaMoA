@@ -3,13 +3,13 @@
 import copy
 import itertools
 from typing import List
-
+import higher
 import numpy as np
 import torch
 import torch.autograd as autograd
 import torch.nn as nn
 import torch.nn.functional as F
-
+from einops import rearrange
 from domainbed import networks
 from domainbed.lib.misc import random_pairs_of_minibatches
 from domainbed.models.resnet_mixstyle import resnet18_mixstyle_L234_p0d5_a0d1, resnet50_mixstyle_L234_p0d5_a0d1
@@ -1061,3 +1061,144 @@ class RSC(ERM):
         self.optimizer.step()
 
         return {"loss": loss.item()}
+
+
+
+
+# +++ Global Router Module (Unchanged) +++
+class GlobalRouter(nn.Module):
+    def __init__(self, input_dim, num_layers, num_experts_per_layer):
+        super(GlobalRouter, self).__init__()
+        self.num_layers = num_layers
+        self.num_experts_per_layer = num_experts_per_layer
+        hidden_dim = 256
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, num_layers * num_experts_per_layer)
+        )
+        print(f"GlobalRouter initialized: input_dim={input_dim}, output_dim={num_layers * num_experts_per_layer}")
+    def forward(self, cls_token):
+        return self.mlp(cls_token)
+
+# The new, simplified MetaMoA Algorithm
+class MetaMoA(ERM):
+    def __init__(self, input_shape, num_classes, num_domains, hparams, args):
+        super(MetaMoA, self).__init__(input_shape, num_classes, num_domains, hparams, args)
+        
+        self.num_vit_layers = 12 
+        self.num_experts_per_layer = 4
+        self.update_count = 0 
+        
+        self.meta_update_freq = self.hparams.get('meta_update_freq', 10)
+        print(f"DEBUG: Simplified MetaMoA configured with meta_update_freq = {self.meta_update_freq}")
+        
+        self.global_router = GlobalRouter(
+            input_dim=self.featurizer.n_outputs,
+            num_layers=self.num_vit_layers,
+            num_experts_per_layer=self.num_experts_per_layer
+        ).cuda()
+
+        local_params = list(self.network.parameters())
+        meta_params = list(self.global_router.parameters())
+        
+        self.local_optimizer = get_optimizer(
+            hparams["optimizer"], local_params, lr=self.hparams["lr"], weight_decay=self.hparams["weight_decay"]
+        )
+        self.meta_optimizer = get_optimizer(
+            hparams.get("meta_optimizer", "Adam"), meta_params, lr=self.hparams.get("meta_lr", 1e-5),
+            weight_decay=self.hparams["weight_decay"]
+        )
+        self.optimizer = self.local_optimizer
+
+    def _inject_and_cleanup_bias(self, bias_vector, batch_size, cleanup=False):
+        """
+        CORRECTED: This helper function no longer needs the `model` argument.
+        It directly accesses `self.featurizer` which is an attribute of the class instance.
+        """
+        if cleanup:
+            for i in range(self.num_vit_layers):
+                # The path is now direct and correct
+                if hasattr(self.featurizer.network.blocks[i].attn.qkv, 'global_router_bias'):
+                    del self.featurizer.network.blocks[i].attn.qkv.global_router_bias
+            return
+        
+        reshaped_bias = bias_vector.view(batch_size, self.num_vit_layers, self.num_experts_per_layer).permute(1, 0, 2)
+        # The path is now direct and correct
+        for i, block in enumerate(self.featurizer.network.blocks):
+            layer_bias = reshaped_bias[i].unsqueeze(1).repeat(1, 197, 1).reshape(-1, self.num_experts_per_layer)
+            block.attn.qkv.global_router_bias = layer_bias
+
+    def update(self, x, y, **kwargs):
+        self.update_count += 1
+        all_x = torch.cat(x)
+        all_y = torch.cat(y)
+        
+        # --- Stage 1: Update Local Adapters and Classifier ---
+        self.local_optimizer.zero_grad()
+        
+        with torch.no_grad():
+            cls_token = self.featurizer.network.forward_features(all_x)[:, 0, :]
+            bias_vector = self.global_router(cls_token).detach()
+
+        try:
+            # CORRECTED: Call helper without the unnecessary `self.network` argument
+            self._inject_and_cleanup_bias(bias_vector, all_x.shape[0])
+            local_logits = self.network(all_x)
+            local_loss = F.cross_entropy(local_logits, all_y)
+            
+            if not torch.isnan(local_loss):
+                local_loss.backward()
+                self.local_optimizer.step()
+            else:
+                print("DEBUG WARNING: Local loss is NaN. Skipping local update.")
+        finally:
+            self._inject_and_cleanup_bias(None, None, cleanup=True)
+
+        # --- Stage 2: Update Global Router (every N steps) ---
+        meta_loss_item = 0.0
+        if self.update_count % self.meta_update_freq == 0:
+            self.meta_optimizer.zero_grad()
+            self.network.eval()
+            self.global_router.train()
+            
+            cls_token = self.featurizer.network.forward_features(all_x)[:, 0, :]
+            bias_vector = self.global_router(cls_token)
+
+            try:
+                # CORRECTED: Call helper without the unnecessary `self.network` argument
+                self._inject_and_cleanup_bias(bias_vector, all_x.shape[0])
+                meta_logits = self.network(all_x)
+                meta_loss = F.cross_entropy(meta_logits, all_y)
+                meta_loss_item = meta_loss.item()
+                
+                if not torch.isnan(meta_loss):
+                    meta_loss.backward()
+                    self.meta_optimizer.step()
+                else:
+                    print("DEBUG WARNING: Meta loss is NaN. Skipping global router update.")
+            finally:
+                self._inject_and_cleanup_bias(None, None, cleanup=True)
+            
+            self.network.train()
+
+        # Use .item() safely
+        final_local_loss = local_loss.item() if not torch.isnan(local_loss) else 0.0
+        return {'loss': meta_loss_item, 'support_loss': final_local_loss}
+
+    def predict(self, x):
+        try:
+            with torch.no_grad():
+                cls_token = self.featurizer.network.forward_features(x)[:, 0, :]
+                bias_vector = self.global_router(cls_token)
+            
+            # CORRECTED: Call helper without the unnecessary `self.network` argument
+            self._inject_and_cleanup_bias(bias_vector, x.shape[0])
+            output = self.network(x)
+        finally:
+            self._inject_and_cleanup_bias(None, None, cleanup=True)
+
+        return output
+
+
+
+

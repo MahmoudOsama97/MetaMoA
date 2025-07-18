@@ -2,7 +2,8 @@
 train_output
 sweep_output
 
-
+*.err
+*.out
 # Not used
 sweep.py
 

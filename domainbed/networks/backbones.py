@@ -4,6 +4,7 @@ import timm
 import torch
 import torch.nn as nn
 import torchvision.models
+import torch.nn.functional as F
 
 
 class Identity(nn.Module):
