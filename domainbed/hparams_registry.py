@@ -39,7 +39,16 @@ def _hparams(algorithm, dataset, random_state):
     else:
         hparams["weight_decay"] = (0.0, 10 ** random_state.uniform(-6, -2))
 
-    if algorithm in ["DANN", "CDANN"]:
+    if algorithm == "MetaMoA":
+        hparams["meta_lr"] = (1e-5, 10 ** random_state.uniform(-6, -4))
+        hparams["meta_update_freq"] = (1, int(random_state.choice([1, 2, 5, 10, 50])))
+        hparams["diversity_weight"] = (0.01, 10 ** random_state.uniform(-3, -1))
+        hparams["warmup_steps"] = (0, int(random_state.choice([0, 500, 1000])))
+        hparams["enhance_router_input"] = (False, False)
+        hparams["use_router_reg"] = (False, False)
+        hparams["router_reg_weight"] = (0.1, 10 ** random_state.uniform(-2, 0))
+
+    elif algorithm in ["DANN", "CDANN"]:
         if dataset not in SMALL_IMAGES:
             hparams["lr_g"] = (5e-5, 10 ** random_state.uniform(-5, -3.5))
             hparams["lr_d"] = (5e-5, 10 ** random_state.uniform(-5, -3.5))
@@ -91,7 +100,6 @@ def _hparams(algorithm, dataset, random_state):
         hparams["rho"] = (0.05, random_state.choice([0.01, 0.02, 0.05, 0.1]))
     elif algorithm == "CutMix":
         hparams["beta"] = (1.0, 1.0)
-        # cutmix_prob is set to 1.0 for ImageNet and 0.5 for CIFAR100 in the original paper.
         hparams["cutmix_prob"] = (1.0, 1.0)
 
     return hparams

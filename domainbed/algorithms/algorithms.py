@@ -3,7 +3,7 @@
 import copy
 import itertools
 from typing import List
-import higher
+# import higher
 import numpy as np
 import torch
 import torch.autograd as autograd
@@ -1088,12 +1088,35 @@ class MetaMoA(ERM):
         self.num_vit_layers = 12 
         self.num_experts_per_layer = 4
         self.update_count = 0 
+        self.args = args # Store args for checking --l_aux
+
+        # --- Initialize Features based on Hyperparameters ---
+        print("--- MetaMoA Feature Configuration ---")
+        self.meta_update_freq = self.hparams.get('meta_update_freq', 1)
+        print(f"Meta-Update Frequency: {self.meta_update_freq}")
         
-        self.meta_update_freq = self.hparams.get('meta_update_freq', 10)
-        print(f"DEBUG: Simplified MetaMoA configured with meta_update_freq = {self.meta_update_freq}")
+        self.warmup_steps = self.hparams.get('warmup_steps', 0)
+        if self.warmup_steps > 0:
+            print(f"Adapter Warm-up Enabled for {self.warmup_steps} steps.")
+
+        self.enhance_router_input = self.hparams.get('enhance_router_input', False)
+        if self.enhance_router_input:
+            print("Enhanced Router Input: Enabled (CLS + Mean/Std Stats)")
+            input_dim = self.featurizer.n_outputs * 3
+        else:
+            print("Enhanced Router Input: Disabled (CLS token only)")
+            input_dim = self.featurizer.n_outputs
+            
+        self.use_router_reg = self.hparams.get('use_router_reg', False)
+        if self.use_router_reg:
+            print(f"Router Output Regularization: Enabled (weight={self.hparams.get('router_reg_weight', 0.1)})")
+        
+        if self.args.l_aux:
+             print(f"Expert Diversity Loss: Enabled (weight={self.hparams.get('diversity_weight', 0.01)})")
+        print("------------------------------------")
         
         self.global_router = GlobalRouter(
-            input_dim=self.featurizer.n_outputs,
+            input_dim=input_dim,
             num_layers=self.num_vit_layers,
             num_experts_per_layer=self.num_experts_per_layer
         ).cuda()
@@ -1110,20 +1133,25 @@ class MetaMoA(ERM):
         )
         self.optimizer = self.local_optimizer
 
-    def _inject_and_cleanup_bias(self, bias_vector, batch_size, cleanup=False):
-        """
-        CORRECTED: This helper function no longer needs the `model` argument.
-        It directly accesses `self.featurizer` which is an attribute of the class instance.
-        """
+    def _get_global_router_input(self, all_features):
+        cls_token = all_features[:, 0, :]
+        # Handle the enhanced input case
+        if self.enhance_router_input:
+            patch_tokens = all_features[:, 1:, :]
+            mean_patches = torch.mean(patch_tokens, dim=1)
+            std_patches = torch.std(patch_tokens, dim=1)
+            return torch.cat([cls_token, mean_patches, std_patches], dim=1)
+        else:
+            return cls_token
+
+    def _inject_and_cleanup_bias(self, cleanup=False, bias_vector=None, batch_size=None):
         if cleanup:
             for i in range(self.num_vit_layers):
-                # The path is now direct and correct
                 if hasattr(self.featurizer.network.blocks[i].attn.qkv, 'global_router_bias'):
                     del self.featurizer.network.blocks[i].attn.qkv.global_router_bias
             return
         
         reshaped_bias = bias_vector.view(batch_size, self.num_vit_layers, self.num_experts_per_layer).permute(1, 0, 2)
-        # The path is now direct and correct
         for i, block in enumerate(self.featurizer.network.blocks):
             layer_bias = reshaped_bias[i].unsqueeze(1).repeat(1, 197, 1).reshape(-1, self.num_experts_per_layer)
             block.attn.qkv.global_router_bias = layer_bias
@@ -1133,72 +1161,87 @@ class MetaMoA(ERM):
         all_x = torch.cat(x)
         all_y = torch.cat(y)
         
-        # --- Stage 1: Update Local Adapters and Classifier ---
+        # --- Proposal 3: Adapter Warm-up Phase ---
+        if self.update_count < self.warmup_steps:
+            self.local_optimizer.zero_grad()
+            logits = self.network(all_x)
+            warmup_loss = F.cross_entropy(logits, all_y)
+            if not torch.isnan(warmup_loss):
+                warmup_loss.backward()
+                self.local_optimizer.step()
+            return {'warmup_loss': warmup_loss.item()}
+
+        # --- Default Two-Stage Update ---
+        # Stage 1: Update Local Adapters and Classifier
         self.local_optimizer.zero_grad()
         
         with torch.no_grad():
-            cls_token = self.featurizer.network.forward_features(all_x)[:, 0, :]
-            bias_vector = self.global_router(cls_token).detach()
+            all_features = self.featurizer.network.forward_features(all_x)
+            router_input = self._get_global_router_input(all_features)
+            bias_vector = self.global_router(router_input).detach()
 
         try:
-            # CORRECTED: Call helper without the unnecessary `self.network` argument
-            self._inject_and_cleanup_bias(bias_vector, all_x.shape[0])
+            self._inject_and_cleanup_bias(bias_vector=bias_vector, batch_size=all_x.shape[0])
             local_logits = self.network(all_x)
             local_loss = F.cross_entropy(local_logits, all_y)
             
-            if not torch.isnan(local_loss):
-                local_loss.backward()
+            total_local_loss = local_loss
+            # Proposal 2: Add diversity loss
+            if self.args.l_aux:
+                diversity_loss = sum(m.aux_loss for m in self.network.modules() if hasattr(m, 'aux_loss'))
+                total_local_loss += self.hparams.get('diversity_weight', 1.0) * diversity_loss
+            
+            if not torch.isnan(total_local_loss):
+                total_local_loss.backward()
                 self.local_optimizer.step()
-            else:
-                print("DEBUG WARNING: Local loss is NaN. Skipping local update.")
         finally:
-            self._inject_and_cleanup_bias(None, None, cleanup=True)
+            self._inject_and_cleanup_bias(cleanup=True)
 
-        # --- Stage 2: Update Global Router (every N steps) ---
+        # Stage 2: Update Global Router (every N steps)
         meta_loss_item = 0.0
         if self.update_count % self.meta_update_freq == 0:
             self.meta_optimizer.zero_grad()
             self.network.eval()
             self.global_router.train()
             
-            cls_token = self.featurizer.network.forward_features(all_x)[:, 0, :]
-            bias_vector = self.global_router(cls_token)
+            all_features_meta = self.featurizer.network.forward_features(all_x)
+            router_input_meta = self._get_global_router_input(all_features_meta)
+            bias_vector_meta = self.global_router(router_input_meta)
 
             try:
-                # CORRECTED: Call helper without the unnecessary `self.network` argument
-                self._inject_and_cleanup_bias(bias_vector, all_x.shape[0])
+                self._inject_and_cleanup_bias(bias_vector=bias_vector_meta, batch_size=all_x.shape[0])
                 meta_logits = self.network(all_x)
                 meta_loss = F.cross_entropy(meta_logits, all_y)
-                meta_loss_item = meta_loss.item()
                 
-                if not torch.isnan(meta_loss):
-                    meta_loss.backward()
+                total_meta_loss = meta_loss
+                # Proposal 4: Router output regularization
+                if self.use_router_reg:
+                    router_reg_loss = torch.mean(bias_vector_meta ** 2)
+                    total_meta_loss += self.hparams.get('router_reg_weight', 0.1) * router_reg_loss
+                
+                meta_loss_item = total_meta_loss.item()
+                if not torch.isnan(total_meta_loss):
+                    total_meta_loss.backward()
                     self.meta_optimizer.step()
-                else:
-                    print("DEBUG WARNING: Meta loss is NaN. Skipping global router update.")
             finally:
-                self._inject_and_cleanup_bias(None, None, cleanup=True)
+                self._inject_and_cleanup_bias(cleanup=True)
             
             self.network.train()
 
-        # Use .item() safely
-        final_local_loss = local_loss.item() if not torch.isnan(local_loss) else 0.0
+        final_local_loss = local_loss.item() if 'local_loss' in locals() and not torch.isnan(local_loss) else 0.0
         return {'loss': meta_loss_item, 'support_loss': final_local_loss}
 
     def predict(self, x):
         try:
             with torch.no_grad():
-                cls_token = self.featurizer.network.forward_features(x)[:, 0, :]
-                bias_vector = self.global_router(cls_token)
-            
-            # CORRECTED: Call helper without the unnecessary `self.network` argument
-            self._inject_and_cleanup_bias(bias_vector, x.shape[0])
+                all_features = self.featurizer.network.forward_features(x)
+                router_input = self._get_global_router_input(all_features)
+                bias_vector = self.global_router(router_input)
+            self._inject_and_cleanup_bias(bias_vector=bias_vector, batch_size=x.shape[0])
             output = self.network(x)
         finally:
-            self._inject_and_cleanup_bias(None, None, cleanup=True)
-
+            self._inject_and_cleanup_bias(cleanup=True)
         return output
-
 
 
 
