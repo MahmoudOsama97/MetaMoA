@@ -183,7 +183,8 @@ class K_Linear_MoE_new_(nn.Linear, LoRALayer):
     def forward(self, x: torch.Tensor):
         # The method signature now accepts an optional 'global_router_bias'
         # This bias will be attached to the layer before calling forward.
-        global_router_bias = getattr(self, 'global_router_bias', None)
+        global_router_guidance = getattr(self, 'global_router_bias', None)
+        guidance_type = getattr(self, 'guidance_type', 'additive')
 
         def T(w):
             return w.T if self.fan_in_fan_out else w
@@ -198,23 +199,22 @@ class K_Linear_MoE_new_(nn.Linear, LoRALayer):
             input_reshaped = rearrange(x, 'b c d -> (b c) d')
             logits = self.router(input_reshaped)
 
-            # Add the bias from the Global Router if it's provided
-            if global_router_bias is not None:
-                try:
-                    # Defensive shape check for debugging
-                    assert global_router_bias.shape == logits.shape, \
-                        f"Shape mismatch: global_router_bias {global_router_bias.shape} != logits {logits.shape}"
-                    
-                    logits = logits + global_router_bias
-                    
-                    # For debugging: print the magnitude of the bias being applied
-                    # print(f"DEBUG: Applying global router bias with mean abs value: {torch.mean(torch.abs(global_router_bias)).item():.4f}")
 
-                except Exception as e:
-                    print(f"ERROR applying global_router_bias: {e}")
-                    # In a negative scenario, proceed without the bias to prevent a crash
-                    pass
-            # --- End of HMR modification ---
+            # --- MODIFICATION: Switchable Guidance Mechanism ---
+            if global_router_guidance is not None:
+                if guidance_type == 'multiplicative':
+                    # Apply a sigmoid to turn the guidance into a gate [0, 1]
+                    gate = torch.sigmoid(global_router_guidance)
+                    # Multiply the local router's opinion by the global gate
+                    logits = logits * gate
+                elif guidance_type == 'additive':
+                    # The original method: add a bias to the local router's opinion
+                    logits = logits + global_router_guidance
+                else:
+                    # Safety check for invalid hyperparameter values
+                    print(f"WARNING: Unknown guidance_type '{guidance_type}'. Defaulting to additive.")
+                    logits = logits + global_router_guidance
+            # --- END OF MODIFICATION ---
             
             if self.training and 1.0 > 0:
                 logits_w = logits + 1.0 * torch.randn_like(logits) / self.n

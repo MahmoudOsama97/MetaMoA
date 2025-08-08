@@ -25,7 +25,7 @@ def _hparams(algorithm, dataset, random_state):
     if dataset not in SMALL_IMAGES:
         hparams["lr"] = (5e-5, 10 ** random_state.uniform(-5, -3.5))
         if dataset == "DomainNet":
-            hparams["batch_size"] = (32, int(2 ** random_state.uniform(3, 5)))
+            hparams["batch_size"] = (16, 16)
         else:
             hparams["batch_size"] = (32, int(2 ** random_state.uniform(3, 4)))
         if algorithm == "ARM":
@@ -42,11 +42,13 @@ def _hparams(algorithm, dataset, random_state):
     if algorithm == "MetaMoA":
         hparams["meta_lr"] = (1e-5, 10 ** random_state.uniform(-6, -4))
         hparams["meta_update_freq"] = (1, int(random_state.choice([1, 2, 5, 10, 50])))
-        hparams["diversity_weight"] = (0.01, 10 ** random_state.uniform(-3, -1))
+        hparams["diversity_weight"] = (1.0, 10 ** random_state.uniform(-3, -1))
         hparams["warmup_steps"] = (0, int(random_state.choice([0, 500, 1000])))
         hparams["enhance_router_input"] = (False, False)
         hparams["use_router_reg"] = (False, False)
         hparams["router_reg_weight"] = (0.1, 10 ** random_state.uniform(-2, 0))
+        hparams["hidden_dim"] = (256, 256)
+        hparams["guidance_type"] = ("additive", random_state.choice(["additive", "multiplicative"]))
 
     elif algorithm in ["DANN", "CDANN"]:
         if dataset not in SMALL_IMAGES:

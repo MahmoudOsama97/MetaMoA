@@ -15,6 +15,7 @@ from domainbed.lib.misc import random_pairs_of_minibatches
 from domainbed.models.resnet_mixstyle import resnet18_mixstyle_L234_p0d5_a0d1, resnet50_mixstyle_L234_p0d5_a0d1
 from domainbed.models.resnet_mixstyle2 import resnet18_mixstyle2_L234_p0d5_a0d1, resnet50_mixstyle2_L234_p0d5_a0d1
 from domainbed.optimizers import get_optimizer
+from domainbed.models.lora.lora_util import K_Linear_MoE_new_ 
 
 #  import higher
 
@@ -1067,11 +1068,10 @@ class RSC(ERM):
 
 # +++ Global Router Module (Unchanged) +++
 class GlobalRouter(nn.Module):
-    def __init__(self, input_dim, num_layers, num_experts_per_layer):
+    def __init__(self, input_dim, num_layers, num_experts_per_layer, hidden_dim=256):
         super(GlobalRouter, self).__init__()
         self.num_layers = num_layers
         self.num_experts_per_layer = num_experts_per_layer
-        hidden_dim = 256
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, num_layers * num_experts_per_layer)
@@ -1112,13 +1112,26 @@ class MetaMoA(ERM):
             print(f"Router Output Regularization: Enabled (weight={self.hparams.get('router_reg_weight', 0.1)})")
         
         if self.args.l_aux:
-             print(f"Expert Diversity Loss: Enabled (weight={self.hparams.get('diversity_weight', 0.01)})")
+             print(f"Expert Diversity Loss: Enabled (weight={self.hparams.get('diversity_weight', 1.0)})")
         print("------------------------------------")
         
+        # --- MODIFICATION: Read guidance_type and propagate it to the adapters ---
+        self.guidance_type = self.hparams.get('guidance_type', 'additive')
+        print(f"Guidance Mechanism: {self.guidance_type.capitalize()}")
+        
+        # --- CORRECTED MODIFICATION: Use a robust check for the Kronecker MoE adapters ---
+        for module in self.network.modules():
+            # This check is now precise: it looks for the exact adapter class you are using.
+            # This is the most robust way to ensure we're modifying the correct layers.
+            if isinstance(module, K_Linear_MoE_new_):
+                setattr(module, 'guidance_type', self.guidance_type)
+        # --- END OF CORRECTION ---
+
         self.global_router = GlobalRouter(
             input_dim=input_dim,
             num_layers=self.num_vit_layers,
-            num_experts_per_layer=self.num_experts_per_layer
+            num_experts_per_layer=self.num_experts_per_layer,
+            hidden_dim=self.hparams.get('hidden_dim', 256)
         ).cuda()
 
         local_params = list(self.network.parameters())
