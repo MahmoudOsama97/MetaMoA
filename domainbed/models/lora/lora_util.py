@@ -200,18 +200,19 @@ class K_Linear_MoE_new_(nn.Linear, LoRALayer):
             logits = self.router(input_reshaped)
 
 
-            # --- MODIFICATION: Switchable Guidance Mechanism ---
+            # --- MODIFICATION: Handle 'affine' guidance type ---
             if global_router_guidance is not None:
-                if guidance_type == 'multiplicative':
-                    # Apply a sigmoid to turn the guidance into a gate [0, 1]
+                if guidance_type == 'affine':
+                    # Split the double-sized guidance into two parts
+                    multiplicative_part, additive_part = global_router_guidance.chunk(2, dim=-1)
+                    gate = torch.sigmoid(multiplicative_part)
+                    logits = logits * gate + additive_part
+                elif guidance_type == 'multiplicative':
                     gate = torch.sigmoid(global_router_guidance)
-                    # Multiply the local router's opinion by the global gate
                     logits = logits * gate
                 elif guidance_type == 'additive':
-                    # The original method: add a bias to the local router's opinion
                     logits = logits + global_router_guidance
                 else:
-                    # Safety check for invalid hyperparameter values
                     print(f"WARNING: Unknown guidance_type '{guidance_type}'. Defaulting to additive.")
                     logits = logits + global_router_guidance
             # --- END OF MODIFICATION ---

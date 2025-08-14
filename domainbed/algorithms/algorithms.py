@@ -1063,23 +1063,67 @@ class RSC(ERM):
 
         return {"loss": loss.item()}
 
+class GlobalRouterMLP(nn.Module):
+    def __init__(self, input_dim, num_layers, num_experts_per_layer, hidden_dim=256, router_depth=2, guidance_type='additive'):
+        super(GlobalRouterMLP, self).__init__()
+        assert router_depth >= 2, "MLP router depth must be at least 2"
+        
+        # If affine, output size is doubled to produce both gate (m) and bias (c)
+        output_dim_multiplier = 2 if guidance_type == 'affine' else 1
+        output_dim = num_layers * num_experts_per_layer * output_dim_multiplier
+        
+        layers = [nn.Linear(input_dim, hidden_dim), nn.ReLU()]
+        for _ in range(router_depth - 2):
+            layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
+        layers.append(nn.Linear(hidden_dim, output_dim))
+        
+        self.mlp = nn.Sequential(*layers)
+        print(f"Initialized MLP Router: depth={router_depth}, output_dim={output_dim}")
 
+    def forward(self, x):
+        return self.mlp(x)
 
-
-# +++ Global Router Module (Unchanged) +++
-class GlobalRouter(nn.Module):
-    def __init__(self, input_dim, num_layers, num_experts_per_layer, hidden_dim=256):
-        super(GlobalRouter, self).__init__()
+# Stateful Recurrent Global Router
+class GlobalRouterRecurrent(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers, num_experts_per_layer, guidance_type='additive'):
+        super(GlobalRouterRecurrent, self).__init__()
         self.num_layers = num_layers
-        self.num_experts_per_layer = num_experts_per_layer
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, num_layers * num_experts_per_layer)
-        )
-        print(f"GlobalRouter initialized: input_dim={input_dim}, output_dim={num_layers * num_experts_per_layer}")
-    def forward(self, cls_token):
-        return self.mlp(cls_token)
+        self.gru_cell = nn.GRUCell(input_dim, hidden_dim)
 
+        output_dim_multiplier = 2 if guidance_type == 'affine' else 1
+        projection_out_features = num_experts_per_layer * output_dim_multiplier
+        self.projection = nn.Linear(hidden_dim, projection_out_features)
+        
+        print(f"Initialized Recurrent Router: hidden_dim={hidden_dim}, projection_out={projection_out_features}")
+        
+    def forward(self, context_vector, batch_size):
+        h_prev = torch.zeros(batch_size, self.gru_cell.hidden_size, device=context_vector.device)
+        all_biases = []
+        for _ in range(self.num_layers):
+            h_current = self.gru_cell(context_vector, h_prev)
+            layer_bias = self.projection(h_current)
+            all_biases.append(layer_bias)
+            h_prev = h_current
+        return torch.cat(all_biases, dim=1)
+
+# Interpretable Key-Value Attention Router
+class GlobalRouterAttention(nn.Module):
+    def __init__(self, input_dim, num_strategies, num_layers, num_experts_per_layer, guidance_type='additive'):
+        super(GlobalRouterAttention, self).__init__()
+        output_dim_multiplier = 2 if guidance_type == 'affine' else 1
+        value_dim = num_layers * num_experts_per_layer * output_dim_multiplier
+        
+        self.domain_keys = nn.Parameter(torch.randn(num_strategies, input_dim))
+        self.domain_values = nn.Parameter(torch.randn(num_strategies, value_dim))
+        self.scale = input_dim ** -0.5
+        
+        print(f"Initialized Attention Router: num_strategies={num_strategies}, value_dim={value_dim}")
+
+    def forward(self, x):
+        attn_logits = (x @ self.domain_keys.T) * self.scale
+        self.attn_weights = F.softmax(attn_logits, dim=-1)
+        final_bias_vector = self.attn_weights @ self.domain_values
+        return final_bias_vector
 # The new, simplified MetaMoA Algorithm
 class MetaMoA(ERM):
     def __init__(self, input_shape, num_classes, num_domains, hparams, args):
@@ -1093,13 +1137,16 @@ class MetaMoA(ERM):
         # --- Initialize Features based on Hyperparameters ---
         print("--- MetaMoA Feature Configuration ---")
         self.meta_update_freq = self.hparams.get('meta_update_freq', 1)
+        self.warmup_steps = self.hparams.get('warmup_steps', 0)
+        self.enhance_router_input = self.hparams.get('enhance_router_input', False)
+        self.use_router_reg = self.hparams.get('use_router_reg', False)
+        self.guidance_type = self.hparams.get('guidance_type', 'additive')
+        self.router_type = self.hparams.get('router_type', 'mlp')
         print(f"Meta-Update Frequency: {self.meta_update_freq}")
         
-        self.warmup_steps = self.hparams.get('warmup_steps', 0)
         if self.warmup_steps > 0:
             print(f"Adapter Warm-up Enabled for {self.warmup_steps} steps.")
 
-        self.enhance_router_input = self.hparams.get('enhance_router_input', False)
         if self.enhance_router_input:
             print("Enhanced Router Input: Enabled (CLS + Mean/Std Stats)")
             input_dim = self.featurizer.n_outputs * 3
@@ -1107,16 +1154,13 @@ class MetaMoA(ERM):
             print("Enhanced Router Input: Disabled (CLS token only)")
             input_dim = self.featurizer.n_outputs
             
-        self.use_router_reg = self.hparams.get('use_router_reg', False)
         if self.use_router_reg:
             print(f"Router Output Regularization: Enabled (weight={self.hparams.get('router_reg_weight', 0.1)})")
         
         if self.args.l_aux:
-             print(f"Expert Diversity Loss: Enabled (weight={self.hparams.get('diversity_weight', 1.0)})")
+             print(f"Expert Diversity Loss: Enabled (weight={self.hparams.get('diversity_weight', 0.01)})")
         print("------------------------------------")
         
-        # --- MODIFICATION: Read guidance_type and propagate it to the adapters ---
-        self.guidance_type = self.hparams.get('guidance_type', 'additive')
         print(f"Guidance Mechanism: {self.guidance_type.capitalize()}")
         
         # --- CORRECTED MODIFICATION: Use a robust check for the Kronecker MoE adapters ---
@@ -1126,13 +1170,32 @@ class MetaMoA(ERM):
             if isinstance(module, K_Linear_MoE_new_):
                 setattr(module, 'guidance_type', self.guidance_type)
         # --- END OF CORRECTION ---
-
-        self.global_router = GlobalRouter(
-            input_dim=input_dim,
-            num_layers=self.num_vit_layers,
-            num_experts_per_layer=self.num_experts_per_layer,
-            hidden_dim=self.hparams.get('hidden_dim', 256)
-        ).cuda()
+        
+        hidden_dim = self.hparams.get('hidden_dim', 256)
+        if self.router_type == 'recurrent':
+            self.global_router = GlobalRouterRecurrent(
+                input_dim=input_dim, hidden_dim=hidden_dim,
+                num_layers=self.num_vit_layers, num_experts_per_layer=self.num_experts_per_layer,
+                guidance_type=self.guidance_type
+            ).cuda()
+        elif self.router_type == 'mlp':
+            router_depth = self.hparams.get('router_depth', 2)
+            print(f"MLP Router Depth: {router_depth}")
+            self.global_router = GlobalRouterMLP(
+                input_dim=input_dim, num_layers=self.num_vit_layers,
+                num_experts_per_layer=self.num_experts_per_layer,
+                hidden_dim=hidden_dim,
+                guidance_type=self.guidance_type, router_depth=router_depth
+            ).cuda()
+        elif self.router_type == 'attention':
+            num_strategies = self.hparams.get('num_strategies', 8)
+            self.global_router = GlobalRouterAttention(
+                input_dim=input_dim, num_strategies=num_strategies,
+                num_layers=self.num_vit_layers, num_experts_per_layer=self.num_experts_per_layer,
+                guidance_type=self.guidance_type
+            ).cuda()
+        else:
+            raise ValueError(f"Unknown router_type: {self.router_type}")
 
         local_params = list(self.network.parameters())
         meta_params = list(self.global_router.parameters())
@@ -1157,17 +1220,32 @@ class MetaMoA(ERM):
         else:
             return cls_token
 
-    def _inject_and_cleanup_bias(self, cleanup=False, bias_vector=None, batch_size=None):
+    # +++ START: New Helper Method +++
+    def _get_router_bias(self, router_input, all_x):
+        batch_size = all_x.shape[0]
+        if self.router_type == 'recurrent':
+            return self.global_router(router_input, batch_size)
+        else: # MLP
+            return self.global_router(router_input)
+    # +++ END: New Helper Method +++
+    def _inject_and_cleanup_bias(self, cleanup=False, bias_vector=None, batch_size=None, guidance_type='additive'):
         if cleanup:
             for i in range(self.num_vit_layers):
                 if hasattr(self.featurizer.network.blocks[i].attn.qkv, 'global_router_bias'):
                     del self.featurizer.network.blocks[i].attn.qkv.global_router_bias
             return
         
-        reshaped_bias = bias_vector.view(batch_size, self.num_vit_layers, self.num_experts_per_layer).permute(1, 0, 2)
+        # --- THE FIX ---
+        # Determine the size of the guidance vector per expert
+        output_dim_multiplier = 2 if guidance_type == 'affine' else 1
+        features_per_layer = self.num_experts_per_layer * output_dim_multiplier
+        
+        # Use the correct feature size in the view and reshape operations
+        reshaped_bias = bias_vector.view(batch_size, self.num_vit_layers, features_per_layer).permute(1, 0, 2)
         for i, block in enumerate(self.featurizer.network.blocks):
-            layer_bias = reshaped_bias[i].unsqueeze(1).repeat(1, 197, 1).reshape(-1, self.num_experts_per_layer)
+            layer_bias = reshaped_bias[i].unsqueeze(1).repeat(1, 197, 1).reshape(-1, features_per_layer)
             block.attn.qkv.global_router_bias = layer_bias
+        # --- END OF FIX ---
 
     def update(self, x, y, **kwargs):
         self.update_count += 1
@@ -1191,10 +1269,10 @@ class MetaMoA(ERM):
         with torch.no_grad():
             all_features = self.featurizer.network.forward_features(all_x)
             router_input = self._get_global_router_input(all_features)
-            bias_vector = self.global_router(router_input).detach()
+            bias_vector = self._get_router_bias(router_input, all_x).detach() # Modify helper slightly
 
         try:
-            self._inject_and_cleanup_bias(bias_vector=bias_vector, batch_size=all_x.shape[0])
+            self._inject_and_cleanup_bias(bias_vector=bias_vector, batch_size=all_x.shape[0], guidance_type=self.guidance_type)
             local_logits = self.network(all_x)
             local_loss = F.cross_entropy(local_logits, all_y)
             
@@ -1202,13 +1280,13 @@ class MetaMoA(ERM):
             # Proposal 2: Add diversity loss
             if self.args.l_aux:
                 diversity_loss = sum(m.aux_loss for m in self.network.modules() if hasattr(m, 'aux_loss'))
-                total_local_loss += self.hparams.get('diversity_weight', 1.0) * diversity_loss
+                total_local_loss += self.hparams.get('diversity_weight', 0.01) * diversity_loss
             
             if not torch.isnan(total_local_loss):
                 total_local_loss.backward()
                 self.local_optimizer.step()
         finally:
-            self._inject_and_cleanup_bias(cleanup=True)
+            self._inject_and_cleanup_bias(cleanup=True, guidance_type=self.guidance_type)
 
         # Stage 2: Update Global Router (every N steps)
         meta_loss_item = 0.0
@@ -1219,10 +1297,10 @@ class MetaMoA(ERM):
             
             all_features_meta = self.featurizer.network.forward_features(all_x)
             router_input_meta = self._get_global_router_input(all_features_meta)
-            bias_vector_meta = self.global_router(router_input_meta)
+            bias_vector_meta = self._get_router_bias(router_input_meta, all_x)
 
             try:
-                self._inject_and_cleanup_bias(bias_vector=bias_vector_meta, batch_size=all_x.shape[0])
+                self._inject_and_cleanup_bias(bias_vector=bias_vector_meta, batch_size=all_x.shape[0], guidance_type=self.guidance_type)
                 meta_logits = self.network(all_x)
                 meta_loss = F.cross_entropy(meta_logits, all_y)
                 
@@ -1237,7 +1315,7 @@ class MetaMoA(ERM):
                     total_meta_loss.backward()
                     self.meta_optimizer.step()
             finally:
-                self._inject_and_cleanup_bias(cleanup=True)
+                self._inject_and_cleanup_bias(cleanup=True, guidance_type=self.guidance_type)
             
             self.network.train()
 
@@ -1249,8 +1327,8 @@ class MetaMoA(ERM):
             with torch.no_grad():
                 all_features = self.featurizer.network.forward_features(x)
                 router_input = self._get_global_router_input(all_features)
-                bias_vector = self.global_router(router_input)
-            self._inject_and_cleanup_bias(bias_vector=bias_vector, batch_size=x.shape[0])
+                bias_vector = self._get_router_bias(router_input, x)
+            self._inject_and_cleanup_bias(bias_vector=bias_vector, batch_size=x.shape[0], guidance_type=self.guidance_type)
             output = self.network(x)
         finally:
             self._inject_and_cleanup_bias(cleanup=True)

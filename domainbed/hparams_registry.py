@@ -48,7 +48,10 @@ def _hparams(algorithm, dataset, random_state):
         hparams["use_router_reg"] = (False, False)
         hparams["router_reg_weight"] = (0.1, 10 ** random_state.uniform(-2, 0))
         hparams["hidden_dim"] = (256, 256)
-        hparams["guidance_type"] = ("additive", random_state.choice(["additive", "multiplicative"]))
+        hparams["guidance_type"] = ("additive", random_state.choice(["additive", "multiplicative", "affine"]))
+        hparams["router_type"] = ("mlp", random_state.choice(["mlp", "recurrent"]))
+        hparams["num_strategies"] = (8, int(random_state.choice([4, 8, 16])))
+        hparams["router_depth"] = (2, int(random_state.choice([2, 3, 4])))
 
     elif algorithm in ["DANN", "CDANN"]:
         if dataset not in SMALL_IMAGES:
