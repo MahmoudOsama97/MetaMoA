@@ -1,4 +1,4 @@
-# Domain Generalization Using Large Pretrained Models with Mixture-of-Adapters (WACV 2025)
+# MetaMoA: Top-Down Dynamic Guidance for Parameter-Efficient Domain Generalization
 
 by Mahmoud Soliman, Ahmed Redwan, Omar Abdelaziz, Mohamed Sami Shehata
 
@@ -23,8 +23,21 @@ We use [OpenCLIP ViT-B/16](https://huggingface.co/laion/CLIP-ViT-B-16-laion2B-s3
 
 
 ```bash
-python train_all.py nf_vitbase_moelora_every_qkv_new_laux --data_dir [domainbed_data_dir] --algorithm ERM \
- --dataset DomainNet --model nf_vitbase_moek_every_qkv_new --l_aux --seed 1
+python train_all.py MetaMoA_full_router_reg_weight \
+    --data_dir data \
+    --algorithm MetaMoA \
+    --dataset OfficeHome \
+    --model nf_vitbase_moek_every_qkv_new \
+    --seed 1 \
+    --steps 10000 \
+    --l_aux \
+    --use_router_reg True \
+    --router_reg_weight 0.2 \
+    --meta_lr 1e-5 \
+    --meta_update_freq 1 \
+    --diversity_weight 0.01 \
+    --router_type mlp \
+    --hidden_dim 256 \
 ```
 
 ### Results
