@@ -43,6 +43,7 @@ python train_all.py MetaMoA_full_router_reg_weight \
 <p align="center">
     <img src="arch.PNG" width="70%" />
 </p>
+
 Figure 1. An overview of the MetaMoA framework and its training procedure. An input image batch follows two parallel paths. First, in a
 ”look-ahead” pass, it traverses a frozen ViT backbone to extract a holistic feature vector (The [CLS] token), which is then fed to the Global
 Router. This meta-controller produces a Strategic Guidance Vector g. Second, the same input batch is processed by the main ViT, which
@@ -53,6 +54,7 @@ diversity and regularization losses are also shown.
 <p align="center">
     <img src="loss_landscape.png" width="70%" />
 </p>
+
 Figure 2. Visualization of the loss landscape for the local
 adapter parameters (θa) on an unseen target domain. The
 plot shows a 2D cross-section of the high-dimensional loss surface around the final parameters found by MetaMoA (located at
@@ -63,6 +65,7 @@ strong indicator of good generalization performance
 <p align="center">
     <img src="routing.png" width="70%" />
 </p>
+
 Figure 3. Visualization of local expert routing decisions across different ViT layers for a sample image from the OfficeHome dataset.
 Each square corresponds to an image patch (token), and the number and color indicate which of the four experts (0-3) was selected by
 the local router at that position. A clear pattern of specialization emerges through the network’s depth. In the middle layers (d, e), Expert
@@ -72,13 +75,16 @@ demonstrates that our MoE adapters are learning semantically meaningful, special
 <p align="center">
     <img src="tSNE.png" width="70%" />
 </p>
+
 Figure 4. t-SNE Visualization of MetaMoA Feature Embeddings on OfficeHome Target Domains. We project the 768-dimensional
 feature representations learned by our MetaMoA model into a 2D space using t-SNE. Each point corresponds to an image from a held-out
 test domain and is colored by its ground-truth class label. The clear formation of semantically meaningful clusters across all four distinct
 domains—(a) Art, (b) Clipart, (c) Product, and (d) Real-World—demonstrates that our method learns highly separable features, which is a
 key indicator of strong generalization performance.
-### Results
 
+
+
+### Results
 
 <p align="center">
     <img src="results.png" width="70%" />
@@ -87,7 +93,7 @@ key indicator of strong generalization performance.
 
 Table 1. Comparison of different domain generalization methods on five standard benchmarks. All methods use a ViT-B/16 backbone
 pre-trained with CLIP unless specified otherwise. #Param. denotes total parameters, while Trainable #Param. refers to parameters updated
-during training. Our method, ERMM etaM oA, achieves competitive or superior performance while remaining highly parameter-efficient.
+during training. Our method, ERMMeta MoA, achieves competitive or superior performance while remaining highly parameter-efficient.
 Best PEFT results are bolded.
 
 ### Acknowledgements
