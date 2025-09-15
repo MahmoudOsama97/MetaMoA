@@ -32,7 +32,7 @@ python train_all.py MetaMoA_full_router_reg_weight \
     --use_router_reg True \
     --router_reg_weight 0.2 \
     --meta_lr 1e-5 \
-    --meta_update_freq 1 \
+    --meta_update_freq 10 \
     --diversity_weight 0.01 \
     --router_type mlp \
     --hidden_dim 256 \
