@@ -1,7 +1,5 @@
 # MetaMoA: Top-Down Dynamic Guidance for Parameter-Efficient Domain Generalization
 
-by Mahmoud Soliman, Ahmed Redwan, Omar Abdelaziz, Mohamed Sami Shehata
-
 ### Prerequisites 
 
 Dataset Preparation
